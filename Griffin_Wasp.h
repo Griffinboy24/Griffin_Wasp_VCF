@@ -4,151 +4,152 @@
 
 namespace project {
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
     using namespace juce;
     using namespace hise;
     using namespace scriptnode;
 
-    namespace FunctionsClasses {
-        // Additional helper functions or classes can be defined here if needed.
-    }
+    #ifndef M_PI
+    #define M_PI 3.14159265358979323846
+    #endif
+
 
     template <int NV>
     struct Griffin_Wasp : public data::base
     {
         SNEX_NODE(Griffin_Wasp);
 
-        struct MetadataClass
-        {
+        struct MetadataClass {
             SN_NODE_ID("Griffin_Wasp");
         };
 
-        //==============================================================================
-        // Node Properties 
-        //==============================================================================
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
         static constexpr bool hasTail() { return false; }
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int getFixChannelAmount() { return 2; }
 
-        static constexpr int NumDisplayBuffers = 0;
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
         static constexpr int NumAudioFiles = 0;
         static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
 
-        // Parameter indices:
-        // 0: Cutoff, 1: Resonance, 2: FilterType (0=Lowpass, 1=Bandpass, 2=Highpass)
-        int filterType = 0; // Default: Lowpass
+        // Parameter: 0 = Cutoff, 1 = Resonance, 2 = FilterType (0=LP, 1=BP, 2=HP)
+        int filterType = 0;
 
-        // Structure for the three filter outputs.
-        struct SVFOutput {
-            float hp, bp, lp;
+        struct BiquadState {
+            float x1 = 0.0f, x2 = 0.0f;
+            float y1 = 0.0f, y2 = 0.0f;
         };
 
-        //==============================================================================
-        // Audio Effect Class (TPT State Variable Filter with 3 outputs)
-        //==============================================================================
+        BiquadState lpState[2];
+        BiquadState bpState[2];
+        BiquadState hpState[2];
+
+        struct Coefficients {
+            float b0, b1, b2;
+            float a1, a2;
+        };
+
+        Coefficients lpCoeff;
+        Coefficients bpCoeff;
+        Coefficients hpCoeff;
+
+        // Component values 
+        const float R1 = 27000.0f;
+        const float R2 = 27000.0f;
+        const float R3 = 27000.0f;
+        const float R4 = 27000.0f;
+        const float R13 = 1000000.0f;
+        const float R14 = 1000.0f;
+        const float R15 = 100000.0f;
+        const float C2 = 100e-12f;
+        const float C7 = 0.22e-6f;
+
+        // Derived resistor: R_res = ( (R13 + R15) * R14 ) / (R13 + R15 + R14)
+        float R_res() const { return ((R13 + R15) * R14) / (R13 + R15 + R14); }
+
+        // Update filter coefficients based on sampleRate, cutoff, and resonance.
+        void updateCoefficients(float sampleRate, float cutoff, float resonance)
+        {
+            float wc = 2.0f * float(M_PI) * cutoff;
+            float i_bias = wc / 9.855e8f; // OTA bias current
+
+            float rho = resonance;
+            float Rres = R_res();
+            float Rres_rho = (rho * Rres) + R14;
+
+            float b1 = R3 * (1.0f - rho) * Rres * (R13 + R15) * C7;
+            float b0 = R3 * (Rres + R13 + R14 + R15);
+            float a1 = ((Rres_rho * (1.0f - rho) * Rres) + ((Rres + R13 + R15) * R4)) * (R13 + R15) * C7;
+            float a0 = ((Rres_rho + R4) * (Rres + R13 + R14 + R15)) - (Rres_rho * Rres_rho);
+
+            float H1_limit = b1 / a1;
+            float Q = 1.0f / (H1_limit + R2 * C2 * wc);
+
+            float T = 1.0f / sampleRate;
+            float K = std::tan(wc * T / 2.0f);
+            float A = 1.0f + K / Q + K * K;
+
+            // Lowpass coefficients
+            lpCoeff.b0 = (K * K) / A;
+            lpCoeff.b1 = 2.0f * (K * K) / A;
+            lpCoeff.b2 = (K * K) / A;
+            lpCoeff.a1 = 2.0f * (K * K - 1.0f) / A;
+            lpCoeff.a2 = (1.0f - K / Q + K * K) / A;
+
+            // Bandpass coefficients
+            bpCoeff.b0 = (K / Q) / A;
+            bpCoeff.b1 = 0.0f;
+            bpCoeff.b2 = -(K / Q) / A;
+            bpCoeff.a1 = lpCoeff.a1;
+            bpCoeff.a2 = lpCoeff.a2;
+
+            // Highpass coefficients
+            hpCoeff.b0 = 1.0f / A;
+            hpCoeff.b1 = -2.0f / A;
+            hpCoeff.b2 = 1.0f / A;
+            hpCoeff.a1 = lpCoeff.a1;
+            hpCoeff.a2 = lpCoeff.a2;
+        }
+
+        // Reset all biquad state variables.
+        void resetStates()
+        {
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                lpState[ch] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                bpState[ch] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                hpState[ch] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            }
+        }
+
+        // Per-channel audio effect parameters.
         class AudioEffect
         {
         public:
-            AudioEffect(float initCutoff = 5000.0f, float initResonance = 0.5f)
-                : cutoff(initCutoff), resonance(initResonance)
-            {
-                sampleRate = 44100.0;
-                resetState();
-                recalcCoeffs();
-            }
-
-            void prepare(double sr)
-            {
-                sampleRate = sr;
-                resetState();
-                recalcCoeffs();
-            }
-
-            // Process one sample and return HP, BP, and LP outputs.
-            SVFOutput processSample(float x)
-            {
-                // TPT SVF algorithm:
-                float hp = (x - (state_lp + r * state_bp)) * a1;
-                state_bp += g * hp;
-                state_lp += g * state_bp;
-                SVFOutput out{ hp, state_bp, state_lp };
-                return out;
-            }
-
-            void updateCutoff(float newCutoff)
-            {
-                cutoff = newCutoff;
-                recalcCoeffs();
-            }
-
-            void updateResonance(float newRes)
-            {
-                resonance = newRes;
-                recalcCoeffs();
-            }
-
-            void resetState()
-            {
-                state_bp = 0.0f;
-                state_lp = 0.0f;
-            }
-
-        private:
-            double sampleRate;
-            float cutoff;     // Filter cutoff (Hz)
-            float resonance;  // Resonance control (0 to 1)
-
-            // SVF state variables
-            float state_bp = 0.0f;
-            float state_lp = 0.0f;
-
-            // Coefficients for the TPT SVF
-            float g = 0.0f;   // Integration coefficient from tan(pi*cutoff/sampleRate)
-            float r = 0.0f;   // Damping factor (related to Q)
-            float a1 = 0.0f;  // Normalization factor
-
-            // Recalculate coefficients using the bilinear transform.
-            void recalcCoeffs()
-            {
-                // Compute an offset as in the original design.
-                float offset = 1.696e-5f * cutoff;
-                // Compute Q from resonance and offset.
-                float Q = 1.0f / (resonance + offset);
-                // In a TPT SVF, the damping factor r = 1/(2*Q)
-                r = 1.0f / (2.0f * Q);
-                // g is computed via the tan pre-warping.
-                g = std::tan(M_PI * cutoff / static_cast<float>(sampleRate));
-                // Normalization factor.
-                a1 = 1.0f / (1.0f + g);
-            }
+            AudioEffect() {}
+            float cutoff = 5000.0f;
+            float resonance = 0.5f;
+            float sampleRate = 44100.0f;
         };
 
-        // Two instances for stereo processing.
         AudioEffect leftChannelEffect;
         AudioEffect rightChannelEffect;
 
-        //==============================================================================
-        // Main Processing Functions
-        //==============================================================================
+        // Prepare the filter with the given sample rate.
         void prepare(PrepareSpecs specs)
         {
             float sr = specs.sampleRate;
-            leftChannelEffect.prepare(sr);
-            rightChannelEffect.prepare(sr);
+            leftChannelEffect.sampleRate = sr;
+            rightChannelEffect.sampleRate = sr;
+            resetStates();
+            updateCoefficients(sr, 5000.0f, 0.5f);
         }
 
         void reset() {}
 
-        // Process block: for each channel, process each sample through the SVF.
-        // The main output is determined by the FilterType parameter,
-        // and the two alternate responses are sent to display buffers.
+        // Process an audio block.
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
@@ -159,39 +160,54 @@ namespace project {
             float* leftChannelData = audioBlock.getChannelPointer(0);
             float* rightChannelData = audioBlock.getChannelPointer(1);
 
-           
-
             for (int i = 0; i < blockSize; ++i)
             {
-                auto outL = leftChannelEffect.processSample(leftChannelData[i]);
-                auto outR = rightChannelEffect.processSample(rightChannelData[i]);
+                float inL = leftChannelData[i];
+                float inR = rightChannelData[i];
 
-                float mainL = (filterType == 0) ? outL.lp : (filterType == 1 ? outL.bp : outL.hp);
-                float mainR = (filterType == 0) ? outR.lp : (filterType == 1 ? outR.bp : outR.hp);
+                float outLP_L = processBiquad(inL, lpCoeff, lpState[0]);
+                float outBP_L = processBiquad(inL, bpCoeff, bpState[0]);
+                float outHP_L = processBiquad(inL, hpCoeff, hpState[0]);
 
-                leftChannelData[i] = mainL;
-                rightChannelData[i] = mainR;
+                float outLP_R = processBiquad(inR, lpCoeff, lpState[1]);
+                float outBP_R = processBiquad(inR, bpCoeff, bpState[1]);
+                float outHP_R = processBiquad(inR, hpCoeff, hpState[1]);
 
-            
+                float mainOutL = (filterType == 0) ? outLP_L : (filterType == 1 ? outBP_L : outHP_L);
+                float mainOutR = (filterType == 0) ? outLP_R : (filterType == 1 ? outBP_R : outHP_R);
+
+                leftChannelData[i] = mainOutL;
+                rightChannelData[i] = mainOutR;
             }
         }
 
-        //==============================================================================
-        // Parameter Handling
-        //==============================================================================
-        // Parameter index 0: Cutoff; 1: Resonance; 2: FilterType (0=LP, 1=BP, 2=HP)
+        // Process a single sample through the biquad difference equation.
+        float processBiquad(float x, const Coefficients& coeff, BiquadState& state)
+        {
+            float y = coeff.b0 * x + coeff.b1 * state.x1 + coeff.b2 * state.x2 -
+                coeff.a1 * state.y1 - coeff.a2 * state.y2;
+            state.x2 = state.x1;
+            state.x1 = x;
+            state.y2 = state.y1;
+            state.y1 = y;
+            return y;
+        }
+
+        // Parameter handling.
         template <int P>
         void setParameter(double v)
         {
             if (P == 0)
             {
-                leftChannelEffect.updateCutoff(static_cast<float>(v));
-                rightChannelEffect.updateCutoff(static_cast<float>(v));
+                leftChannelEffect.cutoff = static_cast<float>(v);
+                rightChannelEffect.cutoff = static_cast<float>(v);
+                updateCoefficients(leftChannelEffect.sampleRate, static_cast<float>(v), leftChannelEffect.resonance);
             }
             else if (P == 1)
             {
-                leftChannelEffect.updateResonance(static_cast<float>(v));
-                rightChannelEffect.updateResonance(static_cast<float>(v));
+                leftChannelEffect.resonance = static_cast<float>(v);
+                rightChannelEffect.resonance = static_cast<float>(v);
+                updateCoefficients(leftChannelEffect.sampleRate, leftChannelEffect.cutoff, static_cast<float>(v));
             }
             else if (P == 2)
             {
@@ -200,7 +216,6 @@ namespace project {
         }
 
         // Create GUI parameters.
-        // Note: FilterType valid values: 0=Lowpass, 1=Bandpass, 2=Highpass.
         void createParameters(ParameterDataList& data)
         {
             {
@@ -223,25 +238,8 @@ namespace project {
             }
         }
 
-        //==============================================================================
-        // External Data Handling
-        //==============================================================================
-        void setExternalData(const ExternalData& ed, int index)
-        {
-            // Example external data handling.
-        }
-
-        //==============================================================================
-        // Event Handling (MIDI or other events)
-        //==============================================================================
-        void handleHiseEvent(HiseEvent& e)
-        {
-            // Example event handling.
-        }
-
-        //==============================================================================
-        // Frame Processing (required but not used in block processing)
-        //==============================================================================
+        void setExternalData(const ExternalData& ed, int index) {}
+        void handleHiseEvent(HiseEvent& e) {}
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
     };
