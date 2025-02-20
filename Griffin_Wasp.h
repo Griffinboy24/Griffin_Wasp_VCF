@@ -2,8 +2,7 @@
 #include <JuceHeader.h>
 #include <cmath>
 
-namespace project
-{
+namespace project {
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -30,26 +29,33 @@ namespace project
         //==============================================================================
         // Node Properties 
         //==============================================================================
-
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
         static constexpr bool hasTail() { return false; }
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int getFixChannelAmount() { return 2; }
 
+        static constexpr int NumDisplayBuffers = 0;
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
         static constexpr int NumAudioFiles = 0;
         static constexpr int NumFilters = 0;
-        static constexpr int NumDisplayBuffers = 0;
+
+        // Parameter indices:
+        // 0: Cutoff, 1: Resonance, 2: FilterType (0=Lowpass, 1=Bandpass, 2=Highpass)
+        int filterType = 0; // Default: Lowpass
+
+        // Structure for the three filter outputs.
+        struct SVFOutput {
+            float hp, bp, lp;
+        };
 
         //==============================================================================
-        // Audio Effect Class (Linear WASP Filter DSP Implementation)
+        // Audio Effect Class (TPT State Variable Filter with 3 outputs)
         //==============================================================================
         class AudioEffect
         {
         public:
-            // Constructor sets initial cutoff (Hz) and resonance (0-1)
             AudioEffect(float initCutoff = 5000.0f, float initResonance = 0.5f)
                 : cutoff(initCutoff), resonance(initResonance)
             {
@@ -58,7 +64,6 @@ namespace project
                 recalcCoeffs();
             }
 
-            // Initialize filter (called on prepare)
             void prepare(double sr)
             {
                 sampleRate = sr;
@@ -66,83 +71,72 @@ namespace project
                 recalcCoeffs();
             }
 
-            // Process a block of samples using the difference equation
-            void process(float* samples, int numSamples)
+            // Process one sample and return HP, BP, and LP outputs.
+            SVFOutput processSample(float x)
             {
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    float x = samples[i];
-                    float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-                    samples[i] = y;
-                    // Update delay elements
-                    x2 = x1;
-                    x1 = x;
-                    y2 = y1;
-                    y1 = y;
-                }
+                // TPT SVF algorithm:
+                float hp = (x - (state_lp + r * state_bp)) * a1;
+                state_bp += g * hp;
+                state_lp += g * state_bp;
+                SVFOutput out{ hp, state_bp, state_lp };
+                return out;
             }
 
-            // Update cutoff parameter and recalc coefficients
             void updateCutoff(float newCutoff)
             {
                 cutoff = newCutoff;
                 recalcCoeffs();
             }
 
-            // Update resonance parameter and recalc coefficients
             void updateResonance(float newRes)
             {
                 resonance = newRes;
                 recalcCoeffs();
             }
 
-        private:
-            double sampleRate;
-            float cutoff;     // Filter cutoff in Hz
-            float resonance;  // Resonance control (0 to 1)
-
-            // Difference equation coefficients
-            float a1 = 0.0f, a2 = 0.0f;
-            float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
-
-            // State variables for delay elements
-            float x1 = 0.0f, x2 = 0.0f;
-            float y1 = 0.0f, y2 = 0.0f;
-
-            // Recalculate filter coefficients using the bilinear transform
-            void recalcCoeffs()
-            {
-                // Analog cutoff in rad/s
-                float omega = 2.0f * M_PI * cutoff;
-                // Offset from OTA integrator branch (R2=27k, C2=100pF)
-                float offset = 27000.0f * 100e-12f * omega; // ~1.696e-5 * cutoff
-                // Calculate Q from resonance parameter and offset
-                float Q = 1.0f / (resonance + offset);
-
-                // Pre-warp using tan(pi*Cutoff/sampleRate)
-                float K = std::tan(M_PI * cutoff / static_cast<float>(sampleRate));
-                float K2 = K * K;
-                float norm = 1.0f / (1.0f + K / Q + K2);
-
-                // Coefficients derived from analog prototype:
-                // H(s) = omega^2/(s^2 + (omega/Q)*s + omega^2)
-                b0 = K2 * norm;
-                b1 = 2.0f * b0;
-                b2 = b0;
-                a1 = 2.0f * (K2 - 1.0f) * norm;
-                a2 = (1.0f - K / Q + K2) * norm;
-            }
-
             void resetState()
             {
-                x1 = x2 = y1 = y2 = 0.0f;
+                state_bp = 0.0f;
+                state_lp = 0.0f;
+            }
+
+        private:
+            double sampleRate;
+            float cutoff;     // Filter cutoff (Hz)
+            float resonance;  // Resonance control (0 to 1)
+
+            // SVF state variables
+            float state_bp = 0.0f;
+            float state_lp = 0.0f;
+
+            // Coefficients for the TPT SVF
+            float g = 0.0f;   // Integration coefficient from tan(pi*cutoff/sampleRate)
+            float r = 0.0f;   // Damping factor (related to Q)
+            float a1 = 0.0f;  // Normalization factor
+
+            // Recalculate coefficients using the bilinear transform.
+            void recalcCoeffs()
+            {
+                // Compute an offset as in the original design.
+                float offset = 1.696e-5f * cutoff;
+                // Compute Q from resonance and offset.
+                float Q = 1.0f / (resonance + offset);
+                // In a TPT SVF, the damping factor r = 1/(2*Q)
+                r = 1.0f / (2.0f * Q);
+                // g is computed via the tan pre-warping.
+                g = std::tan(M_PI * cutoff / static_cast<float>(sampleRate));
+                // Normalization factor.
+                a1 = 1.0f / (1.0f + g);
             }
         };
+
+        // Two instances for stereo processing.
+        AudioEffect leftChannelEffect;
+        AudioEffect rightChannelEffect;
 
         //==============================================================================
         // Main Processing Functions
         //==============================================================================
-
         void prepare(PrepareSpecs specs)
         {
             float sr = specs.sampleRate;
@@ -152,26 +146,40 @@ namespace project
 
         void reset() {}
 
+        // Process block: for each channel, process each sample through the SVF.
+        // The main output is determined by the FilterType parameter,
+        // and the two alternate responses are sent to display buffers.
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
             auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
             auto audioBlock = fixData.toAudioBlock();
-
-            auto* leftChannelData = audioBlock.getChannelPointer(0);
-            auto* rightChannelData = audioBlock.getChannelPointer(1);
-
             int blockSize = data.getNumSamples();
 
-            leftChannelEffect.process(leftChannelData, blockSize);
-            rightChannelEffect.process(rightChannelData, blockSize);
+            float* leftChannelData = audioBlock.getChannelPointer(0);
+            float* rightChannelData = audioBlock.getChannelPointer(1);
+
+           
+
+            for (int i = 0; i < blockSize; ++i)
+            {
+                auto outL = leftChannelEffect.processSample(leftChannelData[i]);
+                auto outR = rightChannelEffect.processSample(rightChannelData[i]);
+
+                float mainL = (filterType == 0) ? outL.lp : (filterType == 1 ? outL.bp : outL.hp);
+                float mainR = (filterType == 0) ? outR.lp : (filterType == 1 ? outR.bp : outR.hp);
+
+                leftChannelData[i] = mainL;
+                rightChannelData[i] = mainR;
+
+            
+            }
         }
 
         //==============================================================================
         // Parameter Handling
         //==============================================================================
-
-        // Parameter index 0: Cutoff frequency; index 1: Resonance
+        // Parameter index 0: Cutoff; 1: Resonance; 2: FilterType (0=LP, 1=BP, 2=HP)
         template <int P>
         void setParameter(double v)
         {
@@ -185,9 +193,14 @@ namespace project
                 leftChannelEffect.updateResonance(static_cast<float>(v));
                 rightChannelEffect.updateResonance(static_cast<float>(v));
             }
+            else if (P == 2)
+            {
+                filterType = static_cast<int>(v);
+            }
         }
 
-        // Create GUI parameters
+        // Create GUI parameters.
+        // Note: FilterType valid values: 0=Lowpass, 1=Bandpass, 2=Highpass.
         void createParameters(ParameterDataList& data)
         {
             {
@@ -202,48 +215,35 @@ namespace project
                 p.setDefaultValue(0.5);
                 data.add(std::move(p));
             }
+            {
+                parameter::data p("FilterType", { 0, 2, 1 });
+                registerCallback<2>(p);
+                p.setDefaultValue(0);
+                data.add(std::move(p));
+            }
         }
 
         //==============================================================================
         // External Data Handling
         //==============================================================================
-
         void setExternalData(const ExternalData& ed, int index)
         {
-            /*
-            // Example external data handling:
-            ExternalData data = ed;
-            float sampleRate = data.sampleRate;
-            float numChannels = data.numChannels;
-            ed.referBlockTo(externalBuffer[0], 0);
-            ed.referBlockTo(externalBuffer[1], 1);
-            */
+            // Example external data handling.
         }
 
         //==============================================================================
-        // Event Handling (Modify as needed for MIDI or other events)
+        // Event Handling (MIDI or other events)
         //==============================================================================
-
         void handleHiseEvent(HiseEvent& e)
         {
-            /*
-            if (e.isNoteOn())
-            {
-                float note = e.getNoteNumber();
-            }
-            */
+            // Example event handling.
         }
 
         //==============================================================================
-        // Frame Processing (Required by compiler, but not used in block processing)
+        // Frame Processing (required but not used in block processing)
         //==============================================================================
-
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
-
-    private:
-        AudioEffect leftChannelEffect;
-        AudioEffect rightChannelEffect;
     };
 
-}
+} // namespace project
