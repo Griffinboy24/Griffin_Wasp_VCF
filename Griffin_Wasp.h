@@ -1,5 +1,5 @@
-#pragma once
-#include <JuceHeader.h>
+#pragma once 
+#include <JuceHeader.h> 
 #include <cmath>
 
 namespace project {
@@ -8,10 +8,9 @@ namespace project {
     using namespace hise;
     using namespace scriptnode;
 
-    #ifndef M_PI
-    #define M_PI 3.14159265358979323846
-    #endif
-
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
     template <int NV>
     struct Griffin_Wasp : public data::base
@@ -34,7 +33,6 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // Parameter: 0 = Cutoff, 1 = Resonance, 2 = FilterType (0=LP, 1=BP, 2=HP)
         int filterType = 0;
 
         struct BiquadState {
@@ -66,10 +64,10 @@ namespace project {
         const float C2 = 100e-12f;
         const float C7 = 0.22e-6f;
 
-        // Derived resistor: R_res = ( (R13 + R15) * R14 ) / (R13 + R15 + R14)
+      
         float R_res() const { return ((R13 + R15) * R14) / (R13 + R15 + R14); }
 
-        // Update filter coefficients based on sampleRate, cutoff, and resonance.
+   
         void updateCoefficients(float sampleRate, float cutoff, float resonance)
         {
             float wc = 2.0f * float(M_PI) * cutoff;
@@ -79,11 +77,13 @@ namespace project {
             float Rres = R_res();
             float Rres_rho = (rho * Rres) + R14;
 
+            // Resonance network coefficients (from design documents)
             float b1 = R3 * (1.0f - rho) * Rres * (R13 + R15) * C7;
             float b0 = R3 * (Rres + R13 + R14 + R15);
             float a1 = ((Rres_rho * (1.0f - rho) * Rres) + ((Rres + R13 + R15) * R4)) * (R13 + R15) * C7;
             float a0 = ((Rres_rho + R4) * (Rres + R13 + R14 + R15)) - (Rres_rho * Rres_rho);
 
+         
             float H1_limit = b1 / a1;
             float Q = 1.0f / (H1_limit + R2 * C2 * wc);
 
@@ -91,17 +91,17 @@ namespace project {
             float K = std::tan(wc * T / 2.0f);
             float A = 1.0f + K / Q + K * K;
 
-            // Lowpass coefficients
+            // Lowpass coefficients (standard bilinear transform for 2nd order LP)
             lpCoeff.b0 = (K * K) / A;
             lpCoeff.b1 = 2.0f * (K * K) / A;
             lpCoeff.b2 = (K * K) / A;
             lpCoeff.a1 = 2.0f * (K * K - 1.0f) / A;
             lpCoeff.a2 = (1.0f - K / Q + K * K) / A;
 
-            // Bandpass coefficients
-            bpCoeff.b0 = (K / Q) / A;
+     
+            bpCoeff.b0 = 2.0f * (K / Q) / A;
             bpCoeff.b1 = 0.0f;
-            bpCoeff.b2 = -(K / Q) / A;
+            bpCoeff.b2 = -2.0f * (K / Q) / A;
             bpCoeff.a1 = lpCoeff.a1;
             bpCoeff.a2 = lpCoeff.a2;
 
@@ -244,4 +244,4 @@ namespace project {
         void processFrame(FrameDataType& data) {}
     };
 
-} // namespace project
+	} // namespace project
