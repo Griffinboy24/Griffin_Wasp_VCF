@@ -1,4 +1,4 @@
-#pragma once 
+#pragma once
 #include <JuceHeader.h> 
 #include <cmath>
 
@@ -33,6 +33,7 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
+        // Parameter: 0 = Cutoff, 1 = Resonance, 2 = FilterType (0=LP, 1=BP, 2=HP)
         int filterType = 0;
 
         struct BiquadState {
@@ -64,18 +65,20 @@ namespace project {
         const float C2 = 100e-12f;
         const float C7 = 0.22e-6f;
 
-      
+        // Derived resistor: R_res = ( (R13 + R15) * R14 ) / (R13 + R15 + R14)
         float R_res() const { return ((R13 + R15) * R14) / (R13 + R15 + R14); }
 
-   
+        // Update filter coefficients based on sampleRate, cutoff, and resonance.
+        // Note: We introduce a scaling factor (resScale) to boost the influence of the resonance network.
         void updateCoefficients(float sampleRate, float cutoff, float resonance)
         {
             float wc = 2.0f * float(M_PI) * cutoff;
-            float i_bias = wc / 9.855e8f; // OTA bias current
+            // Linear OTA modeling: i_bias = wc / 9.855e8, per design
+            float i_bias = wc / 9.855e8f;
 
             float rho = resonance;
             float Rres = R_res();
-            float Rres_rho = (rho * Rres) + R14;
+            float Rres_rho = (rho * Rres) + R14; 
 
             // Resonance network coefficients (from design documents)
             float b1 = R3 * (1.0f - rho) * Rres * (R13 + R15) * C7;
@@ -83,22 +86,26 @@ namespace project {
             float a1 = ((Rres_rho * (1.0f - rho) * Rres) + ((Rres + R13 + R15) * R4)) * (R13 + R15) * C7;
             float a0 = ((Rres_rho + R4) * (Rres + R13 + R14 + R15)) - (Rres_rho * Rres_rho);
 
-         
-            float H1_limit = b1 / a1;
+            // To make resonance parameter effective, scale the small term (b1/a1)
+            const float resScale = 200.0f; // Adjust this constant as needed
+            float H1_limit = (b1 / a1) * resScale;
+
+            // Q factor computed from resonance feedback and the fixed R2*C2*wc term.
             float Q = 1.0f / (H1_limit + R2 * C2 * wc);
 
             float T = 1.0f / sampleRate;
             float K = std::tan(wc * T / 2.0f);
             float A = 1.0f + K / Q + K * K;
 
-            // Lowpass coefficients (standard bilinear transform for 2nd order LP)
+            // Lowpass coefficients (from bilinear transform)
             lpCoeff.b0 = (K * K) / A;
             lpCoeff.b1 = 2.0f * (K * K) / A;
             lpCoeff.b2 = (K * K) / A;
             lpCoeff.a1 = 2.0f * (K * K - 1.0f) / A;
             lpCoeff.a2 = (1.0f - K / Q + K * K) / A;
 
-     
+            // Bandpass coefficients.
+            // Note: With a lower Q (due to the scaling), (K/Q) is larger and the bandpass gain increases.
             bpCoeff.b0 = 2.0f * (K / Q) / A;
             bpCoeff.b1 = 0.0f;
             bpCoeff.b2 = -2.0f * (K / Q) / A;
@@ -243,5 +250,4 @@ namespace project {
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
     };
-
-	} // namespace project
+}
